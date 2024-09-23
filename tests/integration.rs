@@ -7151,6 +7151,53 @@ mod common_parallel {
 
         handle_child_output(r, &output);
     }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_simple_kexec() {
+        let jammy = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(jammy));
+        let mut kernel_path = direct_kernel_boot_path();
+        kernel_path.pop();
+        kernel_path.push("bzImage");
+        let mut child = GuestCommand::new(&guest)
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--console", "tty"])
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+            let bzimage_remote_path = "/home/cloud/bzImage";
+            let _ = scp_to_guest(
+                Path::new(kernel_path.to_str().unwrap()),
+                Path::new(bzimage_remote_path),
+                &guest.network.guest_ip,
+                DEFAULT_SSH_RETRIES,
+                DEFAULT_SSH_TIMEOUT,
+            );
+            let append_arg = "test_simple_kexec=1";
+            let guest_command = format!(
+                "sudo kexec -s {} --reuse-cmdline --append={}",
+                &bzimage_remote_path, append_arg,
+            );
+            let _ = guest.ssh_command(guest_command.as_str()).unwrap();
+            guest.wait_vm_boot(None).unwrap();
+            let stdout_cmdline = guest.ssh_command("sudo cat /proc/cmdline").unwrap();
+            let op = stdout_cmdline.trim();
+            if !op.contains(append_arg) {
+                panic!("New kernel cmdline is wrong");
+            }
+        });
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+    }
 }
 
 mod dbus_api {
