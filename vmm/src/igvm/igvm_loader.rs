@@ -2,31 +2,29 @@
 //
 // Copyright © 2023, Microsoft Corporation
 //
-use crate::cpu::CpuManager;
-use zerocopy::AsBytes;
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::io::{Read, Seek, SeekFrom};
+use std::mem::size_of;
+use std::sync::{Arc, Mutex};
 
-use crate::igvm::{
-    loader::Loader, BootPageAcceptance, IgvmLoadedInfo, StartupMemoryType, HV_PAGE_SIZE,
-};
-use crate::memory_manager::MemoryManager;
-use igvm::{snp_defs::SevVmsa, IgvmDirectiveHeader, IgvmFile, IgvmPlatformHeader, IsolationType};
+use igvm::snp_defs::SevVmsa;
+use igvm::{IgvmDirectiveHeader, IgvmFile, IgvmPlatformHeader, IsolationType};
 use igvm_defs::{
     IgvmPageDataType, IgvmPlatformType, IGVM_VHS_PARAMETER, IGVM_VHS_PARAMETER_INSERT,
 };
-use mshv_bindings::*;
-use std::collections::HashMap;
-use std::ffi::CString;
-use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
-use std::mem::size_of;
-use std::sync::{Arc, Mutex};
-use thiserror::Error;
-
-#[cfg(feature = "sev_snp")]
-use crate::GuestMemoryMmap;
 #[cfg(feature = "sev_snp")]
 use igvm_defs::{MemoryMapEntryType, IGVM_VHS_MEMORY_MAP_ENTRY};
+use mshv_bindings::*;
+use thiserror::Error;
+use zerocopy::AsBytes;
+
+use crate::cpu::CpuManager;
+use crate::igvm::loader::Loader;
+use crate::igvm::{BootPageAcceptance, IgvmLoadedInfo, StartupMemoryType, HV_PAGE_SIZE};
+use crate::memory_manager::MemoryManager;
+#[cfg(feature = "sev_snp")]
+use crate::GuestMemoryMmap;
 
 #[derive(Debug, Error)]
 pub enum Error {

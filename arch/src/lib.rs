@@ -10,14 +10,15 @@
 #[macro_use]
 extern crate log;
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::{fmt, result};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
 #[cfg(target_arch = "x86_64")]
 use crate::x86_64::SgxEpcSection;
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::fmt;
-use std::result;
-use std::sync::Arc;
-use thiserror::Error;
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<vm_memory::bitmap::AtomicBitmap>;
 type GuestRegionMmap = vm_memory::GuestRegionMmap<vm_memory::bitmap::AtomicBitmap>;

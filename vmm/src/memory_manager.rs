@@ -2,16 +2,20 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
-#[cfg(target_arch = "x86_64")]
-use crate::config::SgxEpcConfig;
-use crate::config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
+
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
-use crate::coredump::{
-    CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
-};
-use crate::migration::url_to_path;
-use crate::MEMORY_MANAGER_SNAPSHOT_ID;
-use crate::{GuestMemoryMmap, GuestRegionMmap};
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self};
+use std::ops::{BitAnd, Deref, Not, Sub};
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+use std::os::fd::AsFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::path::PathBuf;
+use std::sync::{Arc, Barrier, Mutex};
+use std::{ffi, result, thread};
+
 use acpi_tables::{aml, Aml};
 use anyhow::anyhow;
 #[cfg(target_arch = "x86_64")]
@@ -25,19 +29,6 @@ use libc::_SC_NPROCESSORS_ONLN;
 #[cfg(target_arch = "x86_64")]
 use libc::{MAP_NORESERVE, MAP_POPULATE, MAP_SHARED, PROT_READ, PROT_WRITE};
 use serde::{Deserialize, Serialize};
-#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{self};
-use std::ops::{BitAnd, Deref, Not, Sub};
-#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
-use std::os::fd::AsFd;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::path::PathBuf;
-use std::result;
-use std::sync::{Arc, Barrier, Mutex};
-use std::{ffi, thread};
 use tracer::trace_scoped;
 use virtio_devices::BlocksState;
 #[cfg(target_arch = "x86_64")]
@@ -46,15 +37,25 @@ use vm_allocator::{AddressAllocator, SystemAllocator};
 use vm_device::BusDevice;
 use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::guest_memory::FileOffset;
+use vm_memory::mmap::MmapRegionError;
 use vm_memory::{
-    mmap::MmapRegionError, Address, Error as MmapError, GuestAddress, GuestAddressSpace,
-    GuestMemory, GuestMemoryAtomic, GuestMemoryError, GuestMemoryRegion, GuestUsize, MmapRegion,
-    ReadVolatile,
+    Address, Error as MmapError, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
+    GuestMemoryError, GuestMemoryRegion, GuestUsize, MmapRegion, ReadVolatile,
 };
+use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
 use vm_migration::{
-    protocol::MemoryRange, protocol::MemoryRangeTable, Migratable, MigratableError, Pausable,
-    Snapshot, SnapshotData, Snapshottable, Transportable,
+    Migratable, MigratableError, Pausable, Snapshot, SnapshotData, Snapshottable, Transportable,
 };
+
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+use crate::coredump::{
+    CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
+};
+use crate::migration::url_to_path;
+#[cfg(target_arch = "x86_64")]
+use crate::vm_config::SgxEpcConfig;
+use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
+use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID};
 
 pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
 

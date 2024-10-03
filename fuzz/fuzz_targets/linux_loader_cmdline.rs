@@ -9,7 +9,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use vm_memory::{bitmap::AtomicBitmap, GuestAddress};
+use vm_memory::bitmap::AtomicBitmap;
+use vm_memory::GuestAddress;
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 
@@ -18,7 +19,7 @@ const MEM_SIZE: usize = 256 * 1024 * 1024;
 const CMDLINE_START: GuestAddress = GuestAddress(0x20000);
 
 fuzz_target!(|bytes| {
-    let payload_config = vmm::config::PayloadConfig {
+    let payload_config = vmm::vm_config::PayloadConfig {
         firmware: None,
         kernel: None,
         cmdline: Some(String::from_utf8_lossy(&bytes).to_string()),

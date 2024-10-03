@@ -5,8 +5,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use hypervisor::HypervisorType;
+use seccompiler::SeccompCmpOp::Eq;
 use seccompiler::{
-    BackendError, BpfProgram, Error, SeccompAction, SeccompCmpArgLen as ArgLen, SeccompCmpOp::Eq,
+    BackendError, BpfProgram, Error, SeccompAction, SeccompCmpArgLen as ArgLen,
     SeccompCondition as Cond, SeccompFilter, SeccompRule,
 };
 
@@ -148,19 +149,23 @@ mod kvm {
     pub const KVM_NMI: u64 = 0xae9a;
 }
 
-#[cfg(feature = "kvm")]
-use kvm::*;
-
 // MSHV IOCTL code. This is unstable until the kernel code has been declared stable.
 #[cfg(feature = "mshv")]
 use hypervisor::mshv::mshv_ioctls::*;
+#[cfg(feature = "kvm")]
+use kvm::*;
 
 #[cfg(feature = "mshv")]
 fn create_vmm_ioctl_seccomp_rule_common_mshv() -> Result<Vec<SeccompRule>, BackendError> {
     Ok(or![
         and![Cond::new(1, ArgLen::Dword, Eq, MSHV_CREATE_PARTITION())?],
-        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_MAP_GUEST_MEMORY())?],
-        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_UNMAP_GUEST_MEMORY())?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            MSHV_INITIALIZE_PARTITION()
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SET_GUEST_MEMORY())?],
         and![Cond::new(1, ArgLen::Dword, Eq, MSHV_CREATE_VP())?],
         and![Cond::new(1, ArgLen::Dword, Eq, MSHV_IRQFD())?],
         and![Cond::new(1, ArgLen::Dword, Eq, MSHV_IOEVENTFD())?],
@@ -186,7 +191,7 @@ fn create_vmm_ioctl_seccomp_rule_common_mshv() -> Result<Vec<SeccompRule>, Backe
             1,
             ArgLen::Dword,
             Eq,
-            MSHV_GET_GPA_ACCESS_STATES()
+            MSHV_GET_GPAP_ACCESS_BITMAP()
         )?],
         and![Cond::new(1, ArgLen::Dword, Eq, MSHV_VP_TRANSLATE_GVA())?],
         and![Cond::new(
@@ -700,8 +705,7 @@ fn create_vcpu_ioctl_seccomp_rule_mshv() -> Result<Vec<SeccompRule>, BackendErro
         and![Cond::new(1, ArgLen::Dword, Eq, MSHV_RUN_VP())?],
         and![Cond::new(1, ArgLen::Dword, Eq, MSHV_GET_VP_REGISTERS())?],
         and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SET_VP_REGISTERS())?],
-        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_MAP_GUEST_MEMORY())?],
-        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_UNMAP_GUEST_MEMORY())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SET_GUEST_MEMORY())?],
         and![Cond::new(1, ArgLen::Dword, Eq, MSHV_VP_TRANSLATE_GVA())?],
         and![Cond::new(1, ArgLen::Dword, Eq, MSHV_GET_VP_CPUID_VALUES())?],
         and![Cond::new(

@@ -12,22 +12,22 @@ pub mod layout;
 mod mpspec;
 mod mptable;
 pub mod regs;
-use crate::GuestMemoryMmap;
-use crate::InitramfsConfig;
-use crate::RegionType;
+use std::collections::BTreeMap;
+use std::mem;
+
 use hypervisor::arch::x86::{CpuIdEntry, CPUID_FLAG_VALID_INDEX};
 use hypervisor::{CpuVendor, HypervisorCpuError, HypervisorError};
 use linux_loader::loader::bootparam::{boot_params, setup_header};
 use linux_loader::loader::elf::start_info::{
     hvm_memmap_table_entry, hvm_modlist_entry, hvm_start_info,
 };
-use std::collections::BTreeMap;
-use std::mem;
 use thiserror::Error;
 use vm_memory::{
     Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemory, GuestMemoryAtomic,
     GuestMemoryRegion, GuestUsize,
 };
+
+use crate::{GuestMemoryMmap, InitramfsConfig, RegionType};
 mod smbios;
 use std::arch::x86_64;
 #[cfg(feature = "tdx")]
@@ -1551,8 +1551,9 @@ fn update_cpuid_sgx(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use linux_loader::loader::bootparam::boot_e820_entry;
+
+    use super::*;
 
     #[test]
     fn regions_base_addr() {
@@ -1580,7 +1581,7 @@ mod tests {
             None,
             None,
         );
-        assert!(config_err.is_err());
+        config_err.unwrap_err();
 
         // Now assigning some memory that falls before the 32bit memory hole.
         let arch_mem_regions = arch_memory_regions();
@@ -1685,13 +1686,13 @@ mod tests {
         // Exercise the scenario where the field storing the length of the e820 entry table is
         // is bigger than the allocated memory.
         params.e820_entries = params.e820_table.len() as u8 + 1;
-        assert!(add_e820_entry(
+        add_e820_entry(
             &mut params,
             e820_table[0].addr,
             e820_table[0].size,
-            e820_table[0].type_
+            e820_table[0].type_,
         )
-        .is_err());
+        .unwrap_err();
     }
 
     #[test]

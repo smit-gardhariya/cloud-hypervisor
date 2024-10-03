@@ -2,20 +2,20 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::vhdx::{
-    vhdx_bat::{BatEntry, VhdxBatError},
-    vhdx_header::{RegionInfo, RegionTableEntry, VhdxHeader, VhdxHeaderError},
-    vhdx_io::VhdxIoError,
-    vhdx_metadata::{DiskSpec, VhdxMetadataError},
-};
-use crate::BlockBackend;
-use byteorder::{BigEndian, ByteOrder};
-use remain::sorted;
 use std::collections::btree_map::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
+
+use byteorder::{BigEndian, ByteOrder};
+use remain::sorted;
 use thiserror::Error;
 use uuid::Uuid;
+
+use crate::vhdx::vhdx_bat::{BatEntry, VhdxBatError};
+use crate::vhdx::vhdx_header::{RegionInfo, RegionTableEntry, VhdxHeader, VhdxHeaderError};
+use crate::vhdx::vhdx_io::VhdxIoError;
+use crate::vhdx::vhdx_metadata::{DiskSpec, VhdxMetadataError};
+use crate::BlockBackend;
 
 macro_rules! div_round_up {
     ($n:expr,$d:expr) => {

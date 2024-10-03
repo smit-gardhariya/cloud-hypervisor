@@ -8,17 +8,16 @@
 //
 //
 
+use thiserror::Error;
+use vm_memory::GuestAddress;
+
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::{RegList, VcpuInit};
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86::{CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters};
 #[cfg(feature = "tdx")]
 use crate::kvm::{TdxExitDetails, TdxExitStatus};
-use crate::CpuState;
-use crate::MpState;
-use crate::StandardRegisters;
-use thiserror::Error;
-use vm_memory::GuestAddress;
+use crate::{CpuState, MpState, StandardRegisters};
 
 #[cfg(target_arch = "x86_64")]
 #[derive(Copy, Clone, Default)]
@@ -165,12 +164,12 @@ pub enum HypervisorCpuError {
     ///
     /// Setting one reg error
     ///
-    #[error("Failed to init vcpu: {0}")]
+    #[error("Failed to set one reg: {0}")]
     SetRegister(#[source] anyhow::Error),
     ///
     /// Getting one reg error
     ///
-    #[error("Failed to init vcpu: {0}")]
+    #[error("Failed to get one reg: {0}")]
     GetRegister(#[source] anyhow::Error),
     ///
     /// Getting guest clock paused error
@@ -209,15 +208,15 @@ pub enum HypervisorCpuError {
     ///
     /// Getting AArch64 core register error
     ///
-    #[error("Failed to get core register: {0}")]
-    GetCoreRegister(#[source] anyhow::Error),
+    #[error("Failed to get aarch64 core register: {0}")]
+    GetAarchCoreRegister(#[source] anyhow::Error),
     ///
     /// Setting AArch64 core register error
     ///
-    #[error("Failed to set core register: {0}")]
-    SetCoreRegister(#[source] anyhow::Error),
+    #[error("Failed to set aarch64 core register: {0}")]
+    SetAarchCoreRegister(#[source] anyhow::Error),
     ///
-    /// Getting AArch64 registers list error
+    /// Getting registers list error
     ///
     #[error("Failed to retrieve list of registers: {0}")]
     GetRegList(#[source] anyhow::Error),

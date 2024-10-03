@@ -8,23 +8,19 @@ extern crate event_monitor;
 #[macro_use]
 extern crate log;
 
-use crate::api::{
-    ApiRequest, ApiResponse, RequestHandler, VmInfoResponse, VmReceiveMigrationData,
-    VmSendMigrationData, VmmPingResponse,
-};
-use crate::config::{
-    add_to_config, DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, RestoreConfig,
-    UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
-};
-#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
-use crate::coredump::GuestDebuggable;
-use crate::landlock::Landlock;
-use crate::memory_manager::MemoryManager;
-#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-use crate::migration::get_vm_snapshot;
-use crate::migration::{recv_vm_config, recv_vm_state};
-use crate::seccomp_filters::{get_seccomp_filter, Thread};
-use crate::vm::{Error as VmError, Vm, VmState};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{stdout, Read, Write};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::mpsc::{Receiver, RecvError, SendError, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+use std::{io, result, thread};
+
 use anyhow::anyhow;
 #[cfg(feature = "dbus_api")]
 use api::dbus::{DBusApiOptions, DBusApiShutdownChannels};
@@ -38,29 +34,34 @@ use seccompiler::{apply_filter, SeccompAction};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use signal_hook::iterator::{Handle, Signals};
-use std::collections::HashMap;
-use std::fs::File;
-use std::io;
-use std::io::{stdout, Read, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::net::UnixListener;
-use std::os::unix::net::UnixStream;
-use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::mpsc::{Receiver, RecvError, SendError, Sender};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use std::{result, thread};
 use thiserror::Error;
 use tracer::trace_scoped;
 use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::{ReadVolatile, WriteVolatile};
-use vm_migration::{protocol::*, Migratable};
-use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
+use vm_migration::protocol::*;
+use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::unblock_signal;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+
+use crate::api::{
+    ApiRequest, ApiResponse, RequestHandler, VmInfoResponse, VmReceiveMigrationData,
+    VmSendMigrationData, VmmPingResponse,
+};
+use crate::config::{add_to_config, RestoreConfig};
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+use crate::coredump::GuestDebuggable;
+use crate::landlock::Landlock;
+use crate::memory_manager::MemoryManager;
+#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+use crate::migration::get_vm_snapshot;
+use crate::migration::{recv_vm_config, recv_vm_state};
+use crate::seccomp_filters::{get_seccomp_filter, Thread};
+use crate::vm::{Error as VmError, Vm, VmState};
+use crate::vm_config::{
+    DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, UserDeviceConfig, VdpaConfig,
+    VmConfig, VsockConfig,
+};
 
 mod acpi;
 pub mod api;
@@ -868,7 +869,7 @@ impl Vmm {
             activate_evt,
             timestamp,
             self.console_info.clone(),
-            self.console_resize_pipe.as_ref().map(Arc::clone),
+            self.console_resize_pipe.clone(),
             Arc::clone(&self.original_termios_opt),
             Some(snapshot),
         )
@@ -1239,11 +1240,11 @@ fn apply_landlock(vm_config: Arc<Mutex<VmConfig>>) -> result::Result<(), Landloc
 }
 
 impl RequestHandler for Vmm {
-    fn vm_create(&mut self, config: Arc<Mutex<VmConfig>>) -> result::Result<(), VmError> {
+    fn vm_create(&mut self, config: Box<VmConfig>) -> result::Result<(), VmError> {
         // We only store the passed VM config.
         // The VM will be created when being asked to boot it.
         if self.vm_config.is_none() {
-            self.vm_config = Some(config);
+            self.vm_config = Some(Arc::new(Mutex::new(*config)));
             self.console_info =
                 Some(pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?);
 
@@ -1306,7 +1307,7 @@ impl RequestHandler for Vmm {
                         self.hypervisor.clone(),
                         activate_evt,
                         self.console_info.clone(),
-                        self.console_resize_pipe.as_ref().map(Arc::clone),
+                        self.console_resize_pipe.clone(),
                         Arc::clone(&self.original_termios_opt),
                         None,
                         None,
@@ -1433,7 +1434,7 @@ impl RequestHandler for Vmm {
             self.hypervisor.clone(),
             activate_evt,
             self.console_info.clone(),
-            self.console_resize_pipe.as_ref().map(Arc::clone),
+            self.console_resize_pipe.clone(),
             Arc::clone(&self.original_termios_opt),
             Some(snapshot),
             Some(source_url),
@@ -1490,11 +1491,10 @@ impl RequestHandler for Vmm {
         event!("vm", "rebooting");
 
         // First we stop the current VM
-        let (config, console_resize_pipe) = if let Some(mut vm) = self.vm.take() {
+        let config = if let Some(mut vm) = self.vm.take() {
             let config = vm.get_config();
-            let console_resize_pipe = vm.console_resize_pipe();
             vm.shutdown()?;
-            (config, console_resize_pipe)
+            config
         } else {
             return Err(VmError::VmNotCreated);
         };
@@ -1536,7 +1536,7 @@ impl RequestHandler for Vmm {
             self.hypervisor.clone(),
             activate_evt,
             self.console_info.clone(),
-            console_resize_pipe,
+            self.console_resize_pipe.clone(),
             Arc::clone(&self.original_termios_opt),
             None,
             None,
@@ -1555,23 +1555,25 @@ impl RequestHandler for Vmm {
 
     fn vm_info(&self) -> result::Result<VmInfoResponse, VmError> {
         match &self.vm_config {
-            Some(config) => {
+            Some(vm_config) => {
                 let state = match &self.vm {
                     Some(vm) => vm.get_state()?,
                     None => VmState::Created,
                 };
+                let config = vm_config.lock().unwrap().clone();
 
-                let config = Arc::clone(config);
-
-                let mut memory_actual_size = config.lock().unwrap().memory.total_size();
+                let mut memory_actual_size = config.memory.total_size();
                 if let Some(vm) = &self.vm {
                     memory_actual_size -= vm.balloon_size();
                 }
 
-                let device_tree = self.vm.as_ref().map(|vm| vm.device_tree());
+                let device_tree = self
+                    .vm
+                    .as_ref()
+                    .map(|vm| vm.device_tree().lock().unwrap().clone());
 
                 Ok(VmInfoResponse {
-                    config,
+                    config: Box::new(config),
                     state,
                     memory_actual_size,
                     device_tree,
@@ -2144,10 +2146,10 @@ const DEVICE_MANAGER_SNAPSHOT_ID: &str = "device-manager";
 mod unit_tests {
     use super::*;
     #[cfg(target_arch = "x86_64")]
-    use crate::config::DebugConsoleConfig;
-    use config::{
-        ConsoleConfig, ConsoleOutputMode, CpusConfig, HotplugMethod, MemoryConfig, PayloadConfig,
-        RngConfig,
+    use crate::vm_config::DebugConsoleConfig;
+    use crate::vm_config::{
+        ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpusConfig, HotplugMethod, MemoryConfig,
+        PayloadConfig, RngConfig,
     };
 
     fn create_dummy_vmm() -> Vmm {
@@ -2165,8 +2167,8 @@ mod unit_tests {
         .unwrap()
     }
 
-    fn create_dummy_vm_config() -> Arc<Mutex<VmConfig>> {
-        Arc::new(Mutex::new(VmConfig {
+    fn create_dummy_vm_config() -> Box<VmConfig> {
+        Box::new(VmConfig {
             cpus: CpusConfig {
                 boot_vcpus: 1,
                 max_vcpus: 1,
@@ -2174,7 +2176,7 @@ mod unit_tests {
                 kvm_hyperv: false,
                 max_phys_bits: 46,
                 affinity: None,
-                features: config::CpuFeatures::default(),
+                features: CpuFeatures::default(),
             },
             memory: MemoryConfig {
                 size: 536_870_912,
@@ -2243,7 +2245,7 @@ mod unit_tests {
             preserved_fds: None,
             landlock_enable: false,
             landlock_rules: None,
-        }))
+        })
     }
 
     #[test]
@@ -2278,9 +2280,7 @@ mod unit_tests {
             .devices
             .is_none());
 
-        let result = vmm.vm_add_device(device_config.clone());
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(vmm.vm_add_device(device_config.clone()).unwrap().is_none());
         assert_eq!(
             vmm.vm_config
                 .as_ref()
@@ -2327,9 +2327,10 @@ mod unit_tests {
             .user_devices
             .is_none());
 
-        let result = vmm.vm_add_user_device(user_device_config.clone());
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(vmm
+            .vm_add_user_device(user_device_config.clone())
+            .unwrap()
+            .is_none());
         assert_eq!(
             vmm.vm_config
                 .as_ref()
@@ -2375,9 +2376,7 @@ mod unit_tests {
             .disks
             .is_none());
 
-        let result = vmm.vm_add_disk(disk_config.clone());
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(vmm.vm_add_disk(disk_config.clone()).unwrap().is_none());
         assert_eq!(
             vmm.vm_config
                 .as_ref()
@@ -2416,9 +2415,7 @@ mod unit_tests {
         let _ = vmm.vm_create(create_dummy_vm_config());
         assert!(vmm.vm_config.as_ref().unwrap().lock().unwrap().fs.is_none());
 
-        let result = vmm.vm_add_fs(fs_config.clone());
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(vmm.vm_add_fs(fs_config.clone()).unwrap().is_none());
         assert_eq!(
             vmm.vm_config
                 .as_ref()
@@ -2464,9 +2461,7 @@ mod unit_tests {
             .pmem
             .is_none());
 
-        let result = vmm.vm_add_pmem(pmem_config.clone());
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(vmm.vm_add_pmem(pmem_config.clone()).unwrap().is_none());
         assert_eq!(
             vmm.vm_config
                 .as_ref()
@@ -2515,9 +2510,7 @@ mod unit_tests {
             .net
             .is_none());
 
-        let result = vmm.vm_add_net(net_config.clone());
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(vmm.vm_add_net(net_config.clone()).unwrap().is_none());
         assert_eq!(
             vmm.vm_config
                 .as_ref()
@@ -2563,9 +2556,7 @@ mod unit_tests {
             .vdpa
             .is_none());
 
-        let result = vmm.vm_add_vdpa(vdpa_config.clone());
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(vmm.vm_add_vdpa(vdpa_config.clone()).unwrap().is_none());
         assert_eq!(
             vmm.vm_config
                 .as_ref()
@@ -2611,9 +2602,7 @@ mod unit_tests {
             .vsock
             .is_none());
 
-        let result = vmm.vm_add_vsock(vsock_config.clone());
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
+        assert!(vmm.vm_add_vsock(vsock_config.clone()).unwrap().is_none());
         assert_eq!(
             vmm.vm_config
                 .as_ref()

@@ -13,12 +13,12 @@ mod device;
 mod packet;
 mod unix;
 
-pub use self::device::Vsock;
-pub use self::unix::VsockUnixBackend;
-pub use self::unix::VsockUnixError;
+use std::os::unix::io::RawFd;
 
 use packet::VsockPacket;
-use std::os::unix::io::RawFd;
+
+pub use self::device::Vsock;
+pub use self::unix::{VsockUnixBackend, VsockUnixError};
 
 mod defs {
 
@@ -162,21 +162,22 @@ pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {}
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::io::AsRawFd;
+    use std::path::PathBuf;
+    use std::sync::{Arc, RwLock};
+
+    use libc::EFD_NONBLOCK;
+    use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+    use vm_memory::{GuestAddress, GuestMemoryAtomic};
+    use vm_virtio::queue::testing::VirtQueue as GuestQ;
+    use vmm_sys_util::eventfd::EventFd;
+
     use super::device::{VsockEpollHandler, RX_QUEUE_EVENT, TX_QUEUE_EVENT};
     use super::packet::VSOCK_PKT_HDR_SIZE;
     use super::*;
     use crate::device::{VirtioInterrupt, VirtioInterruptType};
     use crate::epoll_helper::EpollHelperHandler;
-    use crate::EpollHelper;
-    use crate::GuestMemoryMmap;
-    use libc::EFD_NONBLOCK;
-    use std::os::unix::io::AsRawFd;
-    use std::path::PathBuf;
-    use std::sync::{Arc, RwLock};
-    use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
-    use vm_memory::{GuestAddress, GuestMemoryAtomic};
-    use vm_virtio::queue::testing::VirtQueue as GuestQ;
-    use vmm_sys_util::eventfd::EventFd;
+    use crate::{EpollHelper, GuestMemoryMmap};
 
     pub struct NoopVirtioInterrupt {}
 

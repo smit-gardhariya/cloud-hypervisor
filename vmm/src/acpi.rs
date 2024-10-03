@@ -2,14 +2,14 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
-use crate::cpu::CpuManager;
-use crate::device_manager::DeviceManager;
-use crate::memory_manager::MemoryManager;
-use crate::pci_segment::PciSegment;
-use crate::{GuestMemoryMmap, GuestRegionMmap};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use acpi_tables::rsdp::Rsdp;
 #[cfg(target_arch = "aarch64")]
 use acpi_tables::sdt::GenericAddress;
-use acpi_tables::{rsdp::Rsdp, sdt::Sdt, Aml};
+use acpi_tables::sdt::Sdt;
+use acpi_tables::Aml;
 #[cfg(target_arch = "aarch64")]
 use arch::aarch64::DeviceInfoForFdt;
 #[cfg(target_arch = "aarch64")]
@@ -17,11 +17,15 @@ use arch::DeviceType;
 use arch::NumaNodes;
 use bitflags::bitflags;
 use pci::PciBdf;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use tracer::trace_scoped;
 use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryRegion};
 use zerocopy::AsBytes;
+
+use crate::cpu::CpuManager;
+use crate::device_manager::DeviceManager;
+use crate::memory_manager::MemoryManager;
+use crate::pci_segment::PciSegment;
+use crate::{GuestMemoryMmap, GuestRegionMmap};
 
 /* Values for Type in APIC sub-headers */
 #[cfg(target_arch = "x86_64")]

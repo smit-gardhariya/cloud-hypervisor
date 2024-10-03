@@ -9,35 +9,33 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 
-use crate::config::{
-    ConsoleOutputMode, DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, UserDeviceConfig,
-    VdpaConfig, VhostMode, VmConfig, VsockConfig,
-};
-use crate::console_devices::{ConsoleDeviceError, ConsoleInfo};
-use crate::cpu::{CpuManager, CPU_MANAGER_ACPI_SIZE};
-use crate::device_tree::{DeviceNode, DeviceTree};
-use crate::interrupt::LegacyUserspaceInterruptManager;
-use crate::interrupt::MsiInterruptManager;
-use crate::memory_manager::{Error as MemoryManagerError, MemoryManager, MEMORY_MANAGER_ACPI_SIZE};
-use crate::pci_segment::PciSegment;
-use crate::serial_manager::{Error as SerialManagerError, SerialManager};
-use crate::vm_config::DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT;
-use crate::GuestRegionMmap;
-use crate::PciDeviceInfo;
-use crate::{device_node, DEVICE_MANAGER_SNAPSHOT_ID};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs::{File, OpenOptions};
+use std::io::{self, stdout, IsTerminal, Seek, SeekFrom};
+use std::num::Wrapping;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::path::PathBuf;
+use std::result;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
 use acpi_tables::sdt::GenericAddress;
 use acpi_tables::{aml, Aml};
 use anyhow::anyhow;
-use arch::layout;
 #[cfg(target_arch = "x86_64")]
 use arch::layout::{APIC_START, IOAPIC_SIZE, IOAPIC_START};
-use arch::NumaNodes;
+use arch::{layout, NumaNodes};
 #[cfg(target_arch = "aarch64")]
 use arch::{DeviceType, MmioDeviceInfo};
+use block::async_io::DiskFile;
+use block::fixed_vhd_sync::FixedVhdDiskSync;
+use block::qcow_sync::QcowDiskSync;
+use block::raw_async_aio::RawFileDiskAio;
+use block::raw_sync::RawFileDiskSync;
+use block::vhdx_sync::VhdxDiskSync;
 use block::{
-    async_io::DiskFile, block_aio_is_supported, block_io_uring_is_supported, detect_image_type,
-    fixed_vhd_sync::FixedVhdDiskSync, qcow, qcow_sync::QcowDiskSync, raw_async_aio::RawFileDiskAio,
-    raw_sync::RawFileDiskSync, vhdx, vhdx_sync::VhdxDiskSync, ImageType,
+    block_aio_is_supported, block_io_uring_is_supported, detect_image_type, qcow, vhdx, ImageType,
 };
 #[cfg(feature = "io_uring")]
 use block::{fixed_vhd_async::FixedVhdDiskAsync, raw_async::RawFileDisk};
@@ -45,15 +43,14 @@ use block::{fixed_vhd_async::FixedVhdDiskAsync, raw_async::RawFileDisk};
 use devices::debug_console::DebugConsole;
 #[cfg(target_arch = "aarch64")]
 use devices::gic;
+use devices::interrupt_controller::InterruptController;
 #[cfg(target_arch = "x86_64")]
 use devices::ioapic;
 #[cfg(target_arch = "aarch64")]
 use devices::legacy::Pl011;
 #[cfg(feature = "pvmemcontrol")]
 use devices::pvmemcontrol::{PvmemcontrolBusDevice, PvmemcontrolPciDevice};
-use devices::{
-    interrupt_controller, interrupt_controller::InterruptController, AcpiNotificationFlags,
-};
+use devices::{interrupt_controller, AcpiNotificationFlags};
 use hypervisor::IoEventAddress;
 use libc::{
     tcsetattr, termios, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, O_TMPFILE, PROT_READ, PROT_WRITE,
@@ -66,26 +63,14 @@ use pci::{
 use rate_limiter::group::RateLimiterGroup;
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs::{File, OpenOptions};
-use std::io::{self, stdout, Seek, SeekFrom};
-use std::num::Wrapping;
-use std::os::fd::RawFd;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::path::PathBuf;
-use std::result;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use tracer::trace_scoped;
 use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd};
-use virtio_devices::transport::VirtioTransport;
-use virtio_devices::transport::{VirtioPciDevice, VirtioPciDeviceActivator};
+use virtio_devices::transport::{VirtioPciDevice, VirtioPciDeviceActivator, VirtioTransport};
 use virtio_devices::vhost_user::VhostUserConfig;
 use virtio_devices::{
-    AccessPlatformMapping, ActivateError, VdpaDmaMapping, VirtioMemMappingSource,
+    AccessPlatformMapping, ActivateError, Endpoint, IommuMapping, VdpaDmaMapping,
+    VirtioMemMappingSource,
 };
-use virtio_devices::{Endpoint, IommuMapping};
 use vm_allocator::{AddressAllocator, SystemAllocator};
 use vm_device::dma_mapping::ExternalDmaMapping;
 use vm_device::interrupt::{
@@ -93,19 +78,31 @@ use vm_device::interrupt::{
 };
 use vm_device::{Bus, BusDevice, BusDeviceSync, Resource};
 use vm_memory::guest_memory::FileOffset;
-use vm_memory::GuestMemoryRegion;
-use vm_memory::{Address, GuestAddress, GuestUsize, MmapRegion};
+use vm_memory::{Address, GuestAddress, GuestMemoryRegion, GuestUsize, MmapRegion};
 #[cfg(target_arch = "x86_64")]
 use vm_memory::{GuestAddressSpace, GuestMemory};
+use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{
-    protocol::MemoryRangeTable, snapshot_from_id, state_from_id, Migratable, MigratableError,
-    Pausable, Snapshot, SnapshotData, Snapshottable, Transportable,
+    snapshot_from_id, state_from_id, Migratable, MigratableError, Pausable, Snapshot, SnapshotData,
+    Snapshottable, Transportable,
 };
-use vm_virtio::AccessPlatform;
-use vm_virtio::VirtioDeviceType;
+use vm_virtio::{AccessPlatform, VirtioDeviceType};
 use vmm_sys_util::eventfd::EventFd;
 #[cfg(target_arch = "x86_64")]
 use {devices::debug_console, devices::legacy::Serial};
+
+use crate::console_devices::{ConsoleDeviceError, ConsoleInfo, ConsoleOutput};
+use crate::cpu::{CpuManager, CPU_MANAGER_ACPI_SIZE};
+use crate::device_tree::{DeviceNode, DeviceTree};
+use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
+use crate::memory_manager::{Error as MemoryManagerError, MemoryManager, MEMORY_MANAGER_ACPI_SIZE};
+use crate::pci_segment::PciSegment;
+use crate::serial_manager::{Error as SerialManagerError, SerialManager};
+use crate::vm_config::{
+    ConsoleOutputMode, DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, UserDeviceConfig,
+    VdpaConfig, VhostMode, VmConfig, VsockConfig, DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT,
+};
+use crate::{device_node, GuestRegionMmap, PciDeviceInfo, DEVICE_MANAGER_SNAPSHOT_ID};
 
 #[cfg(target_arch = "aarch64")]
 const MMIO_LEN: u64 = 0x1000;
@@ -2005,60 +2002,42 @@ impl DeviceManager {
     fn add_virtio_console_device(
         &mut self,
         virtio_devices: &mut Vec<MetaVirtioDevice>,
-        console_fd: Option<RawFd>,
+        console_fd: ConsoleOutput,
         resize_pipe: Option<Arc<File>>,
     ) -> DeviceManagerResult<Option<Arc<virtio_devices::ConsoleResizer>>> {
         let console_config = self.config.lock().unwrap().console.clone();
-        let endpoint = match console_config.mode {
-            ConsoleOutputMode::File => {
-                if let Some(file_fd) = console_fd {
-                    // SAFETY: file_fd is guaranteed to be a valid fd from
-                    // pre_create_console_devices() in vmm/src/console_devices.rs
-                    Endpoint::File(unsafe { File::from_raw_fd(file_fd) })
-                } else {
-                    return Err(DeviceManagerError::InvalidConsoleFd);
-                }
+        let endpoint = match console_fd {
+            ConsoleOutput::File(file) => Endpoint::File(file),
+            ConsoleOutput::Pty(file) => {
+                self.console_resize_pipe = resize_pipe;
+                Endpoint::PtyPair(Arc::new(file.try_clone().unwrap()), file)
             }
-            ConsoleOutputMode::Pty => {
-                if let Some(pty_fd) = console_fd {
-                    // SAFETY: pty_fd is guaranteed to be a valid fd from
-                    // pre_create_console_devices() in vmm/src/console_devices.rs
-                    let file = unsafe { File::from_raw_fd(pty_fd) };
+            ConsoleOutput::Tty(stdout) => {
+                if stdout.is_terminal() {
                     self.console_resize_pipe = resize_pipe;
-                    Endpoint::PtyPair(file.try_clone().unwrap(), file)
-                } else {
-                    return Err(DeviceManagerError::InvalidConsoleFd);
                 }
-            }
-            ConsoleOutputMode::Tty => {
-                if let Some(tty_fd) = console_fd {
-                    // SAFETY: tty_fd is guaranteed to be a valid fd from
-                    // pre_create_console_devices() in vmm/src/console_devices.rs
-                    let stdout = unsafe { File::from_raw_fd(tty_fd) };
-                    // If an interactive TTY then we can accept input
-                    // SAFETY: FFI call. Trivially safe.
-                    if unsafe { libc::isatty(libc::STDIN_FILENO) == 1 } {
-                        // SAFETY: FFI call to dup. Trivially safe.
-                        let stdin = unsafe { libc::dup(libc::STDIN_FILENO) };
-                        if stdin == -1 {
-                            return vmm_sys_util::errno::errno_result()
-                                .map_err(DeviceManagerError::DupFd);
-                        }
-                        // SAFETY: stdin is valid and owned solely by us.
-                        let stdin = unsafe { File::from_raw_fd(stdin) };
-                        Endpoint::FilePair(stdout, stdin)
-                    } else {
-                        Endpoint::File(stdout)
+
+                // If an interactive TTY then we can accept input
+                // SAFETY: FFI call. Trivially safe.
+                if unsafe { libc::isatty(libc::STDIN_FILENO) == 1 } {
+                    // SAFETY: FFI call to dup. Trivially safe.
+                    let stdin = unsafe { libc::dup(libc::STDIN_FILENO) };
+                    if stdin == -1 {
+                        return vmm_sys_util::errno::errno_result()
+                            .map_err(DeviceManagerError::DupFd);
                     }
+                    // SAFETY: stdin is valid and owned solely by us.
+                    let stdin = unsafe { File::from_raw_fd(stdin) };
+                    Endpoint::FilePair(stdout, Arc::new(stdin))
                 } else {
-                    return Err(DeviceManagerError::InvalidConsoleFd);
+                    Endpoint::File(stdout)
                 }
             }
-            ConsoleOutputMode::Socket => {
+            ConsoleOutput::Socket(_) => {
                 return Err(DeviceManagerError::NoSocketOptionSupportForConsoleDevice);
             }
-            ConsoleOutputMode::Null => Endpoint::Null,
-            ConsoleOutputMode::Off => return Ok(None),
+            ConsoleOutput::Null => Endpoint::Null,
+            ConsoleOutput::Off => return Ok(None),
         };
         let id = String::from(CONSOLE_DEVICE_NAME);
 
@@ -2122,31 +2101,24 @@ impl DeviceManager {
 
         // SAFETY: console_info is Some, so it's safe to unwrap.
         let console_info = console_info.unwrap();
-        let serial_writer: Option<Box<dyn io::Write + Send>> = match serial_config.mode {
-            ConsoleOutputMode::File | ConsoleOutputMode::Tty => {
-                if console_info.serial_main_fd.is_none() {
-                    return Err(DeviceManagerError::InvalidConsoleInfo);
-                }
-                // SAFETY: serial_main_fd is Some, so it's safe to unwrap.
-                // SAFETY: serial_main_fd is guaranteed to be a valid fd from
-                // pre_create_console_devices() in vmm/src/console_devices.rs
-                Some(Box::new(unsafe {
-                    File::from_raw_fd(console_info.serial_main_fd.unwrap())
-                }))
+
+        let serial_writer: Option<Box<dyn io::Write + Send>> = match console_info.serial_main_fd {
+            ConsoleOutput::File(ref file) | ConsoleOutput::Tty(ref file) => {
+                Some(Box::new(Arc::clone(file)))
             }
-            ConsoleOutputMode::Off
-            | ConsoleOutputMode::Null
-            | ConsoleOutputMode::Pty
-            | ConsoleOutputMode::Socket => None,
+            ConsoleOutput::Off
+            | ConsoleOutput::Null
+            | ConsoleOutput::Pty(_)
+            | ConsoleOutput::Socket(_) => None,
         };
-        if serial_config.mode != ConsoleOutputMode::Off {
+
+        if !matches!(console_info.serial_main_fd, ConsoleOutput::Off) {
             let serial = self.add_serial_device(interrupt_manager, serial_writer)?;
-            self.serial_manager = match serial_config.mode {
-                ConsoleOutputMode::Pty | ConsoleOutputMode::Tty | ConsoleOutputMode::Socket => {
+            self.serial_manager = match console_info.serial_main_fd {
+                ConsoleOutput::Pty(_) | ConsoleOutput::Tty(_) | ConsoleOutput::Socket(_) => {
                     let serial_manager = SerialManager::new(
                         serial,
                         console_info.serial_main_fd,
-                        serial_config.mode,
                         serial_config.socket,
                     )
                     .map_err(DeviceManagerError::CreateSerialManager)?;
@@ -2169,24 +2141,13 @@ impl DeviceManager {
 
         #[cfg(target_arch = "x86_64")]
         {
-            let debug_console_config = self.config.lock().unwrap().debug_console.clone();
             let debug_console_writer: Option<Box<dyn io::Write + Send>> =
-                match debug_console_config.mode {
-                    ConsoleOutputMode::File | ConsoleOutputMode::Tty => {
-                        if console_info.debug_main_fd.is_none() {
-                            return Err(DeviceManagerError::InvalidConsoleInfo);
-                        }
-                        // SAFETY: debug_main_fd is Some, so it's safe to unwrap.
-                        // SAFETY: debug_main_fd is guaranteed to be a valid fd from
-                        // pre_create_console_devices() in vmm/src/console_devices.rs
-                        Some(Box::new(unsafe {
-                            File::from_raw_fd(console_info.debug_main_fd.unwrap())
-                        }))
-                    }
-                    ConsoleOutputMode::Off
-                    | ConsoleOutputMode::Null
-                    | ConsoleOutputMode::Pty
-                    | ConsoleOutputMode::Socket => None,
+                match console_info.debug_main_fd {
+                    ConsoleOutput::File(file) | ConsoleOutput::Tty(file) => Some(Box::new(file)),
+                    ConsoleOutput::Off
+                    | ConsoleOutput::Null
+                    | ConsoleOutput::Pty(_)
+                    | ConsoleOutput::Socket(_) => None,
                 };
             if let Some(writer) = debug_console_writer {
                 let _ = self.add_debug_console_device(writer)?;
@@ -3896,29 +3857,33 @@ impl DeviceManager {
     ) -> DeviceManagerResult<(u16, PciBdf, Option<Vec<Resource>>)> {
         // Look for the id in the device tree. If it can be found, that means
         // the device is being restored, otherwise it's created from scratch.
-        Ok(
+        let (pci_device_bdf, resources) =
             if let Some(node) = self.device_tree.lock().unwrap().get(id) {
                 info!("Restoring virtio-pci {} resources", id);
                 let pci_device_bdf: PciBdf = node
                     .pci_bdf
                     .ok_or(DeviceManagerError::MissingDeviceNodePciBdf)?;
-                let pci_segment_id = pci_device_bdf.segment();
-
-                self.pci_segments[pci_segment_id as usize]
-                    .pci_bus
-                    .lock()
-                    .unwrap()
-                    .get_device_id(pci_device_bdf.device() as usize)
-                    .map_err(DeviceManagerError::GetPciDeviceId)?;
-
-                (pci_segment_id, pci_device_bdf, Some(node.resources.clone()))
+                (Some(pci_device_bdf), Some(node.resources.clone()))
             } else {
-                let pci_device_bdf =
-                    self.pci_segments[pci_segment_id as usize].next_device_bdf()?;
+                (None, None)
+            };
 
-                (pci_segment_id, pci_device_bdf, None)
-            },
-        )
+        Ok(if let Some(pci_device_bdf) = pci_device_bdf {
+            let pci_segment_id = pci_device_bdf.segment();
+
+            self.pci_segments[pci_segment_id as usize]
+                .pci_bus
+                .lock()
+                .unwrap()
+                .get_device_id(pci_device_bdf.device() as usize)
+                .map_err(DeviceManagerError::GetPciDeviceId)?;
+
+            (pci_segment_id, pci_device_bdf, resources)
+        } else {
+            let pci_device_bdf = self.pci_segments[pci_segment_id as usize].next_device_bdf()?;
+
+            (pci_segment_id, pci_device_bdf, None)
+        })
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -3942,10 +3907,6 @@ impl DeviceManager {
 
     pub(crate) fn pci_segments(&self) -> &Vec<PciSegment> {
         &self.pci_segments
-    }
-
-    pub fn console(&self) -> &Arc<Console> {
-        &self.console
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -4141,30 +4102,34 @@ impl DeviceManager {
             .put_device_id(device_id as usize)
             .map_err(DeviceManagerError::PutPciDeviceId)?;
 
-        // Remove the device from the device tree along with its children.
-        let mut device_tree = self.device_tree.lock().unwrap();
-        let pci_device_node = device_tree
-            .remove_node_by_pci_bdf(pci_device_bdf)
-            .ok_or(DeviceManagerError::MissingPciDevice)?;
+        let (pci_device_handle, id) = {
+            // Remove the device from the device tree along with its children.
+            let mut device_tree = self.device_tree.lock().unwrap();
+            let pci_device_node = device_tree
+                .remove_node_by_pci_bdf(pci_device_bdf)
+                .ok_or(DeviceManagerError::MissingPciDevice)?;
 
-        // For VFIO and vfio-user the PCI device id is the id.
-        // For virtio we overwrite it later as we want the id of the
-        // underlying device.
-        let mut id = pci_device_node.id;
-        let pci_device_handle = pci_device_node
-            .pci_device_handle
-            .ok_or(DeviceManagerError::MissingPciDevice)?;
-        if matches!(pci_device_handle, PciDeviceHandle::Virtio(_)) {
-            // The virtio-pci device has a single child
-            if !pci_device_node.children.is_empty() {
-                assert_eq!(pci_device_node.children.len(), 1);
-                let child_id = &pci_device_node.children[0];
-                id.clone_from(child_id);
+            // For VFIO and vfio-user the PCI device id is the id.
+            // For virtio we overwrite it later as we want the id of the
+            // underlying device.
+            let mut id = pci_device_node.id;
+            let pci_device_handle = pci_device_node
+                .pci_device_handle
+                .ok_or(DeviceManagerError::MissingPciDevice)?;
+            if matches!(pci_device_handle, PciDeviceHandle::Virtio(_)) {
+                // The virtio-pci device has a single child
+                if !pci_device_node.children.is_empty() {
+                    assert_eq!(pci_device_node.children.len(), 1);
+                    let child_id = &pci_device_node.children[0];
+                    id.clone_from(child_id);
+                }
             }
-        }
-        for child in pci_device_node.children.iter() {
-            device_tree.remove(child);
-        }
+            for child in pci_device_node.children.iter() {
+                device_tree.remove(child);
+            }
+
+            (pci_device_handle, id)
+        };
 
         let mut iommu_attached = false;
         if let Some((_, iommu_attached_devices)) = &self.iommu_attached_devices {

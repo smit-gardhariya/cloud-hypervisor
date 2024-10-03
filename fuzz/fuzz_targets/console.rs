@@ -4,15 +4,17 @@
 
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
-use seccompiler::SeccompAction;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::Arc;
+
+use libfuzzer_sys::fuzz_target;
+use seccompiler::SeccompAction;
 use virtio_devices::{VirtioDevice, VirtioInterrupt, VirtioInterruptType};
 use virtio_queue::{Queue, QueueT};
-use vm_memory::{bitmap::AtomicBitmap, Bytes, GuestAddress, GuestMemoryAtomic};
+use vm_memory::bitmap::AtomicBitmap;
+use vm_memory::{Bytes, GuestAddress, GuestMemoryAtomic};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
@@ -66,7 +68,7 @@ fuzz_target!(|bytes| {
             memfd_create(&std::ffi::CString::new("fuzz_console_output").unwrap()).unwrap(),
         )
     };
-    let endpoint = virtio_devices::Endpoint::FilePair(output, pipe_rx);
+    let endpoint = virtio_devices::Endpoint::FilePair(Arc::new(output), Arc::new(pipe_rx));
 
     let (mut console, _) = virtio_devices::Console::new(
         "fuzzer_console".to_owned(),

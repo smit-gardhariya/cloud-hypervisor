@@ -4,13 +4,15 @@
 
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
-use seccompiler::SeccompAction;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::{Arc, Mutex};
+
+use libfuzzer_sys::fuzz_target;
+use seccompiler::SeccompAction;
 use virtio_devices::{BlocksState, Mem, VirtioDevice, VirtioInterrupt, VirtioInterruptType};
 use virtio_queue::{Queue, QueueT};
-use vm_memory::{bitmap::AtomicBitmap, Bytes, GuestAddress, GuestMemoryAtomic};
+use vm_memory::bitmap::AtomicBitmap;
+use vm_memory::{Bytes, GuestAddress, GuestMemoryAtomic};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;

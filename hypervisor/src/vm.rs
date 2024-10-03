@@ -8,6 +8,18 @@
 //
 //
 
+use std::any::Any;
+#[cfg(target_arch = "x86_64")]
+use std::fs::File;
+use std::sync::Arc;
+#[cfg(target_arch = "aarch64")]
+use std::sync::Mutex;
+
+#[cfg(feature = "sev_snp")]
+use igvm_defs::IGVM_VHS_SNP_ID_BLOCK;
+use thiserror::Error;
+use vmm_sys_util::eventfd::EventFd;
+
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::VcpuInit;
 #[cfg(target_arch = "aarch64")]
@@ -17,18 +29,7 @@ use crate::arch::x86::CpuIdEntry;
 use crate::cpu::Vcpu;
 #[cfg(target_arch = "x86_64")]
 use crate::ClockData;
-use crate::UserMemoryRegion;
-use crate::{IoEventAddress, IrqRoutingEntry};
-#[cfg(feature = "sev_snp")]
-use igvm_defs::IGVM_VHS_SNP_ID_BLOCK;
-use std::any::Any;
-#[cfg(target_arch = "x86_64")]
-use std::fs::File;
-use std::sync::Arc;
-#[cfg(target_arch = "aarch64")]
-use std::sync::Mutex;
-use thiserror::Error;
-use vmm_sys_util::eventfd::EventFd;
+use crate::{IoEventAddress, IrqRoutingEntry, UserMemoryRegion};
 
 ///
 /// I/O events data matches (32 or 64 bits).

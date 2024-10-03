@@ -8,23 +8,6 @@
 //
 //
 
-#[cfg(target_arch = "aarch64")]
-use crate::aarch64::gic::KvmGicV3Its;
-#[cfg(target_arch = "aarch64")]
-pub use crate::aarch64::{
-    check_required_kvm_extensions, gic::Gicv3ItsState as GicState, is_system_register, VcpuInit,
-    VcpuKvmState,
-};
-#[cfg(target_arch = "aarch64")]
-use crate::arch::aarch64::gic::{Vgic, VgicConfig};
-use crate::cpu;
-use crate::hypervisor;
-use crate::vec_with_array_field;
-use crate::vm::{self, InterruptSourceConfig, VmOps};
-use crate::HypervisorType;
-#[cfg(target_arch = "aarch64")]
-use crate::{arm64_core_reg_id, offset_of};
-use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
 use std::any::Any;
 use std::collections::HashMap;
 #[cfg(target_arch = "x86_64")]
@@ -36,23 +19,27 @@ use std::os::unix::io::RawFd;
 use std::result;
 #[cfg(target_arch = "x86_64")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+
+use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
 use vmm_sys_util::eventfd::EventFd;
+
+#[cfg(target_arch = "aarch64")]
+use crate::aarch64::gic::KvmGicV3Its;
+#[cfg(target_arch = "aarch64")]
+pub use crate::aarch64::{
+    check_required_kvm_extensions, gic::Gicv3ItsState as GicState, is_system_register, VcpuInit,
+    VcpuKvmState,
+};
+#[cfg(target_arch = "aarch64")]
+use crate::arch::aarch64::gic::{Vgic, VgicConfig};
+use crate::vm::{self, InterruptSourceConfig, VmOps};
+#[cfg(target_arch = "aarch64")]
+use crate::{arm64_core_reg_id, offset_of};
+use crate::{cpu, hypervisor, vec_with_array_field, HypervisorType};
 // x86_64 dependencies
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;
-#[cfg(target_arch = "x86_64")]
-use crate::arch::x86::{
-    CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters, XsaveState, NUM_IOAPIC_PINS,
-};
-#[cfg(target_arch = "x86_64")]
-use crate::ClockData;
-use crate::StandardRegisters;
-use crate::{
-    CpuState, IoEventAddress, IrqRoutingEntry, MpState, UserMemoryRegion,
-    USER_MEMORY_REGION_LOG_DIRTY, USER_MEMORY_REGION_READ, USER_MEMORY_REGION_WRITE,
-};
 #[cfg(target_arch = "aarch64")]
 use aarch64::{RegList, Register};
 #[cfg(target_arch = "x86_64")]
@@ -64,10 +51,23 @@ use kvm_bindings::{
 use x86_64::check_required_kvm_extensions;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{CpuId, ExtendedControlRegisters, MsrEntries, VcpuKvmState};
+
+#[cfg(target_arch = "x86_64")]
+use crate::arch::x86::{
+    CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters, XsaveState, NUM_IOAPIC_PINS,
+};
+#[cfg(target_arch = "x86_64")]
+use crate::ClockData;
+use crate::{
+    CpuState, IoEventAddress, IrqRoutingEntry, MpState, StandardRegisters, UserMemoryRegion,
+    USER_MEMORY_REGION_LOG_DIRTY, USER_MEMORY_REGION_READ, USER_MEMORY_REGION_WRITE,
+};
 // aarch64 dependencies
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
-pub use kvm_bindings;
+#[cfg(target_arch = "aarch64")]
+use std::mem;
+
 pub use kvm_bindings::{
     kvm_clock_data, kvm_create_device, kvm_device_type_KVM_DEV_TYPE_VFIO, kvm_guest_debug,
     kvm_irq_routing, kvm_irq_routing_entry, kvm_mp_state, kvm_userspace_memory_region,
@@ -83,14 +83,12 @@ use kvm_bindings::{
 };
 #[cfg(feature = "tdx")]
 use kvm_bindings::{kvm_run__bindgen_ty_1, KVMIO};
-pub use kvm_ioctls;
 pub use kvm_ioctls::{Cap, Kvm};
-#[cfg(target_arch = "aarch64")]
-use std::mem;
 use thiserror::Error;
 use vfio_ioctls::VfioDeviceFd;
 #[cfg(feature = "tdx")]
 use vmm_sys_util::{ioctl::ioctl_with_val, ioctl_ioc_nr, ioctl_iowr_nr};
+pub use {kvm_bindings, kvm_ioctls};
 ///
 /// Export generically-named wrappers of kvm-bindings for Unix-based platforms
 ///
@@ -104,7 +102,6 @@ const KVM_CAP_SGX_ATTRIBUTE: u32 = 196;
 
 #[cfg(target_arch = "x86_64")]
 use vmm_sys_util::ioctl_io_nr;
-
 #[cfg(all(not(feature = "tdx"), target_arch = "x86_64"))]
 use vmm_sys_util::ioctl_ioc_nr;
 
@@ -1210,7 +1207,6 @@ impl cpu::Vcpu for KvmVcpu {
     ///
     /// Returns StandardRegisters with default value set
     ///
-    #[cfg(target_arch = "x86_64")]
     fn create_standard_regs(&self) -> StandardRegisters {
         kvm_bindings::kvm_regs::default().into()
     }
@@ -1247,7 +1243,7 @@ impl cpu::Vcpu for KvmVcpu {
                 .lock()
                 .unwrap()
                 .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
-                .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+                .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
             state.regs.regs[i] = u64::from_le_bytes(bytes);
             off += std::mem::size_of::<u64>();
         }
@@ -1260,7 +1256,7 @@ impl cpu::Vcpu for KvmVcpu {
             .lock()
             .unwrap()
             .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
-            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
         state.regs.sp = u64::from_le_bytes(bytes);
 
         // Second one, the program counter.
@@ -1270,7 +1266,7 @@ impl cpu::Vcpu for KvmVcpu {
             .lock()
             .unwrap()
             .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
-            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
         state.regs.pc = u64::from_le_bytes(bytes);
 
         // Next is the processor state.
@@ -1280,7 +1276,7 @@ impl cpu::Vcpu for KvmVcpu {
             .lock()
             .unwrap()
             .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
-            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
         state.regs.pstate = u64::from_le_bytes(bytes);
 
         // The stack pointer associated with EL1
@@ -1290,7 +1286,7 @@ impl cpu::Vcpu for KvmVcpu {
             .lock()
             .unwrap()
             .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
-            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
         state.sp_el1 = u64::from_le_bytes(bytes);
 
         // Exception Link Register for EL1, when taking an exception to EL1, this register
@@ -1301,7 +1297,7 @@ impl cpu::Vcpu for KvmVcpu {
             .lock()
             .unwrap()
             .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
-            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
         state.elr_el1 = u64::from_le_bytes(bytes);
 
         // Saved Program Status Registers, there are 5 of them used in the kernel.
@@ -1312,7 +1308,7 @@ impl cpu::Vcpu for KvmVcpu {
                 .lock()
                 .unwrap()
                 .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U64, off), &mut bytes)
-                .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+                .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
             state.spsr[i] = u64::from_le_bytes(bytes);
             off += std::mem::size_of::<u64>();
         }
@@ -1326,7 +1322,7 @@ impl cpu::Vcpu for KvmVcpu {
                 .lock()
                 .unwrap()
                 .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U128, off), &mut bytes)
-                .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+                .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
             state.fp_regs.vregs[i] = u128::from_le_bytes(bytes);
             off += mem::size_of::<u128>();
         }
@@ -1338,7 +1334,7 @@ impl cpu::Vcpu for KvmVcpu {
             .lock()
             .unwrap()
             .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U32, off), &mut bytes)
-            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
         state.fp_regs.fpsr = u32::from_le_bytes(bytes);
 
         // Floating-point Control Register
@@ -1348,7 +1344,7 @@ impl cpu::Vcpu for KvmVcpu {
             .lock()
             .unwrap()
             .get_one_reg(arm64_core_reg_id!(KVM_REG_SIZE_U32, off), &mut bytes)
-            .map_err(|e| cpu::HypervisorCpuError::GetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::GetAarchCoreRegister(e.into()))?;
         state.fp_regs.fpcr = u32::from_le_bytes(bytes);
         Ok(state.into())
     }
@@ -1385,7 +1381,7 @@ impl cpu::Vcpu for KvmVcpu {
                     arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
                     &kvm_regs_state.regs.regs[i].to_le_bytes(),
                 )
-                .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
+                .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
             off += std::mem::size_of::<u64>();
         }
 
@@ -1397,7 +1393,7 @@ impl cpu::Vcpu for KvmVcpu {
                 arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
                 &kvm_regs_state.regs.sp.to_le_bytes(),
             )
-            .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
 
         let off = offset_of!(user_pt_regs, pc);
         self.fd
@@ -1407,7 +1403,7 @@ impl cpu::Vcpu for KvmVcpu {
                 arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
                 &kvm_regs_state.regs.pc.to_le_bytes(),
             )
-            .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
 
         let off = offset_of!(user_pt_regs, pstate);
         self.fd
@@ -1417,7 +1413,7 @@ impl cpu::Vcpu for KvmVcpu {
                 arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
                 &kvm_regs_state.regs.pstate.to_le_bytes(),
             )
-            .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
 
         let off = offset_of!(kvm_regs, sp_el1);
         self.fd
@@ -1427,7 +1423,7 @@ impl cpu::Vcpu for KvmVcpu {
                 arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
                 &kvm_regs_state.sp_el1.to_le_bytes(),
             )
-            .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
 
         let off = offset_of!(kvm_regs, elr_el1);
         self.fd
@@ -1437,7 +1433,7 @@ impl cpu::Vcpu for KvmVcpu {
                 arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
                 &kvm_regs_state.elr_el1.to_le_bytes(),
             )
-            .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
 
         let mut off = offset_of!(kvm_regs, spsr);
         for i in 0..KVM_NR_SPSR as usize {
@@ -1448,7 +1444,7 @@ impl cpu::Vcpu for KvmVcpu {
                     arm64_core_reg_id!(KVM_REG_SIZE_U64, off),
                     &kvm_regs_state.spsr[i].to_le_bytes(),
                 )
-                .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
+                .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
             off += std::mem::size_of::<u64>();
         }
 
@@ -1461,7 +1457,7 @@ impl cpu::Vcpu for KvmVcpu {
                     arm64_core_reg_id!(KVM_REG_SIZE_U128, off),
                     &kvm_regs_state.fp_regs.vregs[i].to_le_bytes(),
                 )
-                .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
+                .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
             off += mem::size_of::<u128>();
         }
 
@@ -1473,7 +1469,7 @@ impl cpu::Vcpu for KvmVcpu {
                 arm64_core_reg_id!(KVM_REG_SIZE_U32, off),
                 &kvm_regs_state.fp_regs.fpsr.to_le_bytes(),
             )
-            .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
 
         let off = offset_of!(kvm_regs, fp_regs) + offset_of!(user_fpsimd_state, fpcr);
         self.fd
@@ -1483,7 +1479,7 @@ impl cpu::Vcpu for KvmVcpu {
                 arm64_core_reg_id!(KVM_REG_SIZE_U32, off),
                 &kvm_regs_state.fp_regs.fpcr.to_le_bytes(),
             )
-            .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
         Ok(())
     }
 
@@ -1966,7 +1962,7 @@ impl cpu::Vcpu for KvmVcpu {
                 arm64_core_reg_id!(KVM_REG_SIZE_U64, pstate),
                 &PSTATE_FAULT_BITS_64.to_le_bytes(),
             )
-            .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
 
         // Other vCPUs are powered off initially awaiting PSCI wakeup.
         if cpu_id == 0 {
@@ -1979,7 +1975,7 @@ impl cpu::Vcpu for KvmVcpu {
                     arm64_core_reg_id!(KVM_REG_SIZE_U64, pc),
                     &boot_ip.to_le_bytes(),
                 )
-                .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
+                .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
 
             // Last mandatory thing to set -> the address pointing to the FDT (also called DTB).
             // "The device tree blob (dtb) must be placed on an 8-byte boundary and must
@@ -1993,7 +1989,7 @@ impl cpu::Vcpu for KvmVcpu {
                     arm64_core_reg_id!(KVM_REG_SIZE_U64, regs0),
                     &fdt_start.to_le_bytes(),
                 )
-                .map_err(|e| cpu::HypervisorCpuError::SetCoreRegister(e.into()))?;
+                .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
         }
         Ok(())
     }
