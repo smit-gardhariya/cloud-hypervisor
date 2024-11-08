@@ -43,7 +43,7 @@ mount -t devpts devpts /dev/pts
 echo "nameserver 1.1.1.1" > /etc/resolv.conf
 export DEBIAN_FRONTEND=noninteractive
 apt update
-apt install -y fio iperf iperf3 socat stress cpuid tpm2-tools kexec-tools
+apt install -y fio iperf iperf3 socat stress cpuid tpm2-tools kexec-tools crash kdump-tools
 apt remove -y --purge snapd pollinate
 source extra_commands
 umount /dev/pts
