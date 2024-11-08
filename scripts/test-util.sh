@@ -63,6 +63,14 @@ build_custom_linux() {
         cp arch/arm64/boot/Image "$WORKLOADS_DIR/" || exit 1
         cp arch/arm64/boot/Image.gz "$WORKLOADS_DIR/" || exit 1
     fi
+
+    # Build debug kernel, This is needed for kernel crash test under integration test-suit
+    cp "$SRCDIR"/resources/debug-linux-config-"${ARCH}" "$LINUX_CUSTOM_DIR"/.config
+
+    make -j "$(nproc)"
+    if [ "${ARCH}" == "x86_64" ]; then
+        cp vmlinux "$WORKLOADS_DIR/debug_vmlinux" || exit 1
+    fi
     popd || exit
 }
 
