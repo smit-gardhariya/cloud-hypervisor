@@ -7,6 +7,7 @@
 
 use std::ffi::OsStr;
 use std::fmt::Display;
+use std::fs::Permissions;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
@@ -547,6 +548,89 @@ pub enum SshCommandError {
     WriteAll(std::io::Error),
     SendEof(ssh2::Error),
     WaitEof(ssh2::Error),
+    FileCreate(std::io::Error),
+    ReadRemoteFile(std::io::Error),
+    WriteLocalFile(std::io::Error),
+    ScpReceive(ssh2::Error),
+    SetPermissions(std::io::Error),
+}
+
+fn scp_from_guest_with_auth(
+    path: &Path,
+    remote_path: &Path,
+    auth: &PasswordAuth,
+    ip: &str,
+    retries: u8,
+    timeout: u8,
+) -> Result<(), SshCommandError> {
+    let mut counter = 0;
+    loop {
+        let closure = || -> Result<(), SshCommandError> {
+            let tcp =
+                TcpStream::connect(format!("{ip}:22")).map_err(SshCommandError::Connection)?;
+            let mut sess = Session::new().unwrap();
+            sess.set_tcp_stream(tcp);
+            sess.handshake().map_err(SshCommandError::Handshake)?;
+
+            sess.userauth_password(&auth.username, &auth.password)
+                .map_err(SshCommandError::Authentication)?;
+            assert!(sess.authenticated());
+
+            let channel = sess
+                .scp_recv(remote_path)
+                .map_err(SshCommandError::ScpReceive)?;
+            let (mut remote_file, stat) = channel;
+
+            // Create a new file locally and set permissions based on the remote file
+            let mut local_file =
+                std::fs::File::create(path).map_err(SshCommandError::FileCreate)?;
+
+            let perms = Permissions::from_mode(stat.mode() as u32);
+            local_file
+                .set_permissions(perms)
+                .map_err(SshCommandError::SetPermissions)?;
+
+            // Read the remote file contents and write to the local file
+            let mut buffer = Vec::new();
+            remote_file
+                .read_to_end(&mut buffer)
+                .map_err(SshCommandError::ReadRemoteFile)?;
+            local_file
+                .write_all(&buffer)
+                .map_err(SshCommandError::WriteLocalFile)?;
+
+            // Gracefully close the remote file channel
+            remote_file.send_eof().map_err(SshCommandError::SendEof)?;
+            remote_file.wait_eof().map_err(SshCommandError::WaitEof)?;
+            let _ = remote_file.close();
+            let _ = remote_file.wait_close();
+            Ok(())
+        };
+
+        match closure() {
+            Ok(_) => break,
+            Err(e) => {
+                counter += 1;
+                if counter >= retries {
+                    eprintln!(
+                        "\n\n==== Start scp command output (FAILED, Attempt {}/{}) ====\n\n\
+                         remote_path =\"{remote_path:?}\"\n\
+                         path =\"{path:?}\"\n\
+                         auth=\"{auth:#?}\"\n\
+                         ip=\"{ip}\"\n\
+                         error=\"{e:?}\"\n\
+                         \n==== End scp command output ====\n\n",
+                        counter, retries
+                    );
+                    return Err(e);
+                }
+            }
+        };
+        // Exponential backoff for retries
+        let backoff = (timeout as u64) * 2u64.pow((counter - 1).into());
+        thread::sleep(std::time::Duration::new(backoff, 0));
+    }
+    Ok(())
 }
 
 fn scp_to_guest_with_auth(
@@ -616,6 +700,26 @@ fn scp_to_guest_with_auth(
         thread::sleep(std::time::Duration::new((timeout * counter).into(), 0));
     }
     Ok(())
+}
+
+pub fn scp_from_guest(
+    path: &Path,
+    remote_path: &Path,
+    ip: &str,
+    retries: u8,
+    timeout: u8,
+) -> Result<(), SshCommandError> {
+    scp_from_guest_with_auth(
+        path,
+        remote_path,
+        &PasswordAuth {
+            username: String::from("cloud"),
+            password: String::from("cloud123"),
+        },
+        ip,
+        retries,
+        timeout,
+    )
 }
 
 pub fn scp_to_guest(
@@ -741,6 +845,7 @@ pub fn exec_host_command_status(command: &str) -> ExitStatus {
 }
 
 pub fn exec_host_command_output(command: &str) -> Output {
+    println!("Running Command: {:?}", command);
     let output = std::process::Command::new("bash")
         .args(["-c", command])
         .output()

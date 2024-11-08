@@ -11,10 +11,11 @@
 extern crate test_infra;
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{BufRead, Read, Seek, Write};
 use std::net::TcpListener;
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::string::String;
 use std::sync::mpsc::Receiver;
@@ -41,7 +42,7 @@ mod x86_64 {
         "focal-server-cloudimg-amd64-custom-20210609-0-backing.qcow2";
     pub const FOCAL_IMAGE_NAME_VHD: &str = "focal-server-cloudimg-amd64-custom-20210609-0.vhd";
     pub const FOCAL_IMAGE_NAME_VHDX: &str = "focal-server-cloudimg-amd64-custom-20210609-0.vhdx";
-    pub const JAMMY_IMAGE_NAME: &str = "jammy-server-cloudimg-amd64-custom-20241017-0.raw";
+    pub const JAMMY_IMAGE_NAME: &str = "jammy-server-cloudimg-amd64-custom-20241108-0.raw";
     pub const WINDOWS_IMAGE_NAME: &str = "windows-server-2022-amd64-2.raw";
     pub const OVMF_NAME: &str = "CLOUDHV.fd";
     pub const GREP_SERIAL_IRQ_CMD: &str = "grep -c 'IO-APIC.*ttyS0' /proc/interrupts || true";
@@ -7163,6 +7164,201 @@ mod common_parallel {
         kill_child(&mut child);
         let output = child.wait_with_output().unwrap();
 
+        handle_child_output(r, &output);
+    }
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_simple_kexec() {
+        let jammy = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(jammy));
+        let mut kernel_path = direct_kernel_boot_path();
+        kernel_path.pop();
+        kernel_path.push("bzImage");
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(["--console", "tty"])
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+            let bzimage_remote_path = "/home/cloud/bzImage";
+            let _ = scp_to_guest(
+                Path::new(kernel_path.to_str().unwrap()),
+                Path::new(bzimage_remote_path),
+                &guest.network.guest_ip,
+                DEFAULT_SSH_RETRIES,
+                DEFAULT_SSH_TIMEOUT,
+            );
+
+            let append_arg = "test_simple_kexec=1";
+            let guest_command = format!(
+                "sudo kexec -s {} --reuse-cmdline --append={}",
+                &bzimage_remote_path, append_arg,
+            );
+            let _ = guest.ssh_command(guest_command.as_str()).unwrap();
+            guest.wait_vm_boot(None).unwrap();
+            let stdout_cmdline = guest.ssh_command("sudo cat /proc/cmdline").unwrap();
+            let op = stdout_cmdline.trim();
+            if !op.contains(append_arg) {
+                panic!("New kernel cmdline is wrong");
+            }
+        });
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_kernel_crash_dump() {
+        let jammy = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(jammy));
+
+        let mut kernel_path = direct_kernel_boot_path();
+        kernel_path.pop();
+        kernel_path.push("bzImage");
+
+        let mut debug_kernel_path = kernel_path.clone();
+        debug_kernel_path.pop();
+        debug_kernel_path.push("vmlinux");
+
+        let crash_cmdline = format!(
+            "{} {}",
+            DIRECT_KERNEL_BOOT_CMDLINE, "quiet splash nokaslr crashkernel=512M-32G:512M,32G-:1024M"
+        );
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--cpus", "boot=4"])
+            .args(["--memory", "size=4G"])
+            .args(["--kernel", kernel_path.to_str().unwrap()])
+            .args(["--cmdline", &crash_cmdline])
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .set_print_cmd(true)
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(Some(200)).unwrap();
+            let bzimage_remote_path = "/home/cloud/bzImage";
+
+            // Clear bzImage if exist
+            let rm_remote_bzimage = format!("sudo rm -rf {}", bzimage_remote_path);
+            guest.ssh_command(&rm_remote_bzimage).unwrap();
+
+            // Clear crash dump if any
+            guest.ssh_command("sudo rm -rf /var/crash/*").unwrap();
+
+            let _ = scp_to_guest(
+                Path::new(kernel_path.to_str().unwrap()),
+                Path::new(bzimage_remote_path),
+                &guest.network.guest_ip,
+                DEFAULT_SSH_RETRIES,
+                DEFAULT_SSH_TIMEOUT,
+            );
+
+            let kernel_ver_raw = guest.ssh_command("uname -r").unwrap();
+            let kernel_ver = kernel_ver_raw.trim();
+            let kdump_config_file = "/etc/default/kdump-tools";
+
+            // Enable kdump
+            let enable_kdump = format!(
+                "sudo sed -i 's|USE_KDUMP=0|USE_KDUMP=1|' {}",
+                kdump_config_file
+            );
+            let _ = guest.ssh_command(&enable_kdump).unwrap();
+
+            let set_makedump_conf = format!(
+                "sudo sed -i 's|#MAKEDUMP_ARGS=\"-c -d 31\"|MAKEDUMP_ARGS=\"-c -d 0\"|' {}",
+                kdump_config_file
+            );
+            let _ = guest.ssh_command(&set_makedump_conf).unwrap();
+
+            // Configure kdump kernel
+            let copy_kdump_kernel = format!(
+                "sudo cp {} /boot/vmlinuz-{}",
+                bzimage_remote_path, kernel_ver
+            );
+            let _ = guest.ssh_command(&copy_kdump_kernel).unwrap();
+            let set_kdump_kernel = format!(
+                "sudo rm -rf /var/lib/kdump/vmlinuz && sudo ln -s /boot/vmlinuz-{} /var/lib/kdump/vmlinuz",
+                kernel_ver
+            );
+            let _ = guest.ssh_command(&set_kdump_kernel).unwrap();
+
+            // Use jammy's in-built initrd for kdump
+            let find_initrd = "sudo ls /boot/initrd.img-* | tail -1";
+            let initrd = guest.ssh_command(find_initrd).unwrap();
+            let initrd_path = initrd.trim();
+
+            let copy_initrd = format!(
+                "sudo cp {} /var/lib/kdump/initrd.img-{}",
+                initrd_path, kernel_ver
+            );
+            let _ = guest.ssh_command(&copy_initrd).unwrap();
+            let set_kdump_initrd = format!(
+                "sudo rm -rf /var/lib/kdump/initrd.img && sudo ln -s /var/lib/kdump/initrd.img-{} /var/lib/kdump/initrd.img",
+				kernel_ver
+            );
+            let _ = guest.ssh_command(&set_kdump_initrd).unwrap();
+
+            // Restart kdump-tools service
+            let _ = guest
+                .ssh_command("sudo systemctl restart kdump-tools")
+                .unwrap();
+
+            // Crash the guest and wait until it comes up
+            guest.ssh_command("screen -dmS reboot sh -c \"sleep 5; echo s | tee /proc/sysrq-trigger; echo c | sudo tee /proc/sysrq-trigger\"").unwrap();
+            guest.wait_vm_boot(Some(150)).unwrap();
+
+            // Get the remote crash dump path
+            let find_crash_dump_file = "ls /var/crash/*/dump.*";
+            let dump = guest.ssh_command(find_crash_dump_file).unwrap();
+            let remote_crashdump_path = dump.trim();
+
+            // Copy remote crashdump onto the host
+            let local_crashdump_path = "/root/workloads/crashdump";
+            let _ = scp_from_guest(
+                Path::new(local_crashdump_path),
+                Path::new(remote_crashdump_path),
+                &guest.network.guest_ip,
+                DEFAULT_SSH_RETRIES,
+                DEFAULT_SSH_TIMEOUT,
+            );
+
+            let run_crash_utility = format!(
+                "echo 'bt\nvm\nps\nquit' | crash {} {}",
+                debug_kernel_path.display(),
+                local_crashdump_path
+            );
+
+            let crash_output = exec_host_command_output(&run_crash_utility);
+            if !crash_output.status.success() {
+                let stdout = String::from_utf8_lossy(&crash_output.stdout);
+                let stderr = String::from_utf8_lossy(&crash_output.stderr);
+                panic!("crash command failed\nstdout\n{stdout}\nstderr\n{stderr}");
+            }
+
+            // Save Crash command output
+            let file = File::create("/root/workloads/crash_output.txt");
+            writeln!(
+                file.expect("cannot get crashoutput file"),
+                "{}",
+                String::from_utf8_lossy(&crash_output.stdout)
+            )
+            .expect("failed to write to crashoutput file");
+        });
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
         handle_child_output(r, &output);
     }
 }

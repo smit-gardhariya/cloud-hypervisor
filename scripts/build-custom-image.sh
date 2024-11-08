@@ -45,6 +45,16 @@ export DEBIAN_FRONTEND=noninteractive
 apt update
 apt install -y fio iperf iperf3 socat stress cpuid tpm2-tools kexec-tools
 apt remove -y --purge snapd pollinate
+
+apt-get update
+sudo dpkg-divert --add --rename --divert /usr/sbin/grub-probe.real /usr/sbin/grub-probe
+echo -e '#!/bin/sh\nexit 0' | sudo tee /usr/sbin/grub-probe > /dev/null
+sudo chmod +x /usr/sbin/grub-probe
+sudo dpkg --configure -a
+apt-get install kdump-tools
+sudo mv /usr/sbin/grub-probe.real /usr/sbin/grub-probe
+sudo dpkg-divert --remove /usr/sbin/grub-probe
+
 source extra_commands
 umount /dev/pts
 umount /proc
