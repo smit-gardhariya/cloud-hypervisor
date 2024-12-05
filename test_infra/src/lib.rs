@@ -845,6 +845,7 @@ pub fn exec_host_command_status(command: &str) -> ExitStatus {
 }
 
 pub fn exec_host_command_output(command: &str) -> Output {
+    println!("Running Command: {:?}", command);
     let output = std::process::Command::new("bash")
         .args(["-c", command])
         .output()
