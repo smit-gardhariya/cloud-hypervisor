@@ -11,7 +11,7 @@
 extern crate test_infra;
 
 use std::collections::HashMap;
-use std::io::{BufRead, Read, Seek, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -7227,7 +7227,7 @@ mod common_parallel {
             .args(["--memory", "size=2G"])
             .args(["--kernel", kernel_path.to_str().unwrap()])
             .args(["--cmdline", &crash_cmdline])
-            .args(["--console", "tty"])
+            //.args(["--console", "tty"])
             .default_disks()
             .default_net()
             .capture_output()
@@ -7317,17 +7317,14 @@ mod common_parallel {
                 DEFAULT_SSH_TIMEOUT,
             );
 
-            let install_crash_command = "sudo apt update -y;sudo apt install crash -y";
-            let install_crash = exec_host_command_output(&install_crash_command);
-
+            //let install_crash_command = "sudo apt update -y;sudo apt install crash -y";
+            //let install_crash = exec_host_command_output(&install_crash_command);
+            
             // Load crashdump on host to verify
             let run_crash_utility = format!(
-                "sudo -E crash {} {} <<EOF
-                bt
-                ps
-                vm
-                quit
-                EOF",
+                //"crash {} {} <<EOF\r\nbt\r\nps\r\nvm\r\nquit\r\nEOF\r\n",
+                //"/root/workloads/run_crash.sh {} {}",
+                "echo | printf {} {}",
                 debug_kernel_path.display(),
                 local_crashdump_path
             );
